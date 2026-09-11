@@ -44,6 +44,7 @@ jobs:
       version_code: ${{ steps.meta.outputs.version_code }}
       xposed_tag: ${{ steps.meta.outputs.xposed_tag }}
       official_signing_cert_sha256: ${{ steps.check.outputs.official_signing_cert_sha256 }}
+      signing_configured: ${{ steps.check.outputs.signing_configured }}
 
     steps:
       - name: Set Timezone to Asia/Shanghai
@@ -197,6 +198,12 @@ jobs:
 
           echo "ready=${ready}" >> "$GITHUB_OUTPUT"
           echo "official_signing_cert_sha256=${OFFICIAL_SIGNING_CERT_SHA256}" >> "$GITHUB_OUTPUT"
+          if [[ -n "${ANDROID_SIGNING_KEY}" && -n "${ANDROID_KEY_ALIAS}" && -n "${ANDROID_KEYSTORE_PASSWORD}" && -n "${ANDROID_KEY_PASSWORD}" && "${fingerprint_format_valid}" == "true" ]]; then
+            signing_configured="true"
+          else
+            signing_configured="false"
+          fi
+          echo "signing_configured=${signing_configured}" >> "$GITHUB_OUTPUT"
           {
             echo "reason<<EOF"
             printf '%s\n' "${reason}"
@@ -322,7 +329,7 @@ jobs:
 
       - name: Sign APKs
         id: sign_apks
-        if: secrets.ANDROID_SIGNING_KEY != '' && vars.OFFICIAL_SIGNING_CERT_SHA256 != ''
+        if: needs.preflight.outputs.signing_configured == 'true'
         uses: ilharp/sign-android-release@v2
         with:
           releaseDir: ${{ env.STAGING_DIR }}
