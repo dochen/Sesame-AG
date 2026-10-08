@@ -328,7 +328,7 @@ class AntSports : ModelTask() {
     private lateinit var originBossIdList: FriendSelectionModelField
     private lateinit var sportsTasksField: BooleanModelField
     private lateinit var sportsEnergyBubble: BooleanModelField
-    private lateinit var sportsEnergyExchange: BooleanModelField
+    internal lateinit var sportsEnergyExchange: BooleanModelField
     private lateinit var sportsEnergyExchangeList: SelectModelField
 
     // 训练好友相关配置
@@ -638,8 +638,6 @@ class AntSports : ModelTask() {
             }
 
             if (ApplicationHookConstants.isOffline()) return
-            runNeverlandWorkflow()
-            if (ApplicationHookConstants.isOffline()) return
             registerPersistentSyncStepTask()
             runStepSyncWorkflow()
             if (ApplicationHookConstants.isOffline()) return
@@ -656,9 +654,7 @@ class AntSports : ModelTask() {
             }
             if (ApplicationHookConstants.isOffline()) return
 
-            if (sportsEnergyExchange.value == true) {
-                sportsEnergyExchange()
-            }
+            runNeverlandWorkflow()
             if (ApplicationHookConstants.isOffline()) return
 
             runRouteWorkflow()
@@ -4084,25 +4080,63 @@ class AntSports : ModelTask() {
         currentPathData: JSONObject?,
         currentPathId: String?,
     ): RouteCandidate? {
-        val recommendPath = currentPathData?.optJSONObject("recommendPath") ?: return null
-        val recommendPathId = recommendPath.optString("pathId", "").trim()
-        if (recommendPathId.isBlank() || recommendPathId == currentPathId) {
+        val recommendPath = currentPathData?.optJSONObject("recommendPath")
+        val recommendPathId = recommendPath?.optString("pathId", "")?.trim().orEmpty()
+        if (recommendPathId.isNotBlank() && recommendPathId != currentPathId) {
+            val pathData = fetchRoutePathData(recommendPathId)
+            val candidate = pathData?.let(::buildRouteCandidateFromPathData)
+            if (
+                candidate != null &&
+                candidate.pathId == recommendPathId &&
+                !isRouteCompleted(candidate.status) &&
+                isRouteCandidateActionable(pathData)
+            ) {
+                return candidate.copy(
+                    name = candidate.name.ifBlank { recommendPath?.optString("name", recommendPathId) ?: recommendPathId },
+                    themeId = candidate.themeId ?: recommendPath?.optString("themeId", "")?.takeIf { it.isNotBlank() },
+                    cityId = candidate.cityId ?: recommendPath?.optString("cityId", "")?.takeIf { it.isNotBlank() },
+                )
+            }
+        }
+        // 路线完成后 queryPath 的 recommendPath 会指向自身或缺失，回退到真实页面的推荐列表接口选下一条未加入路线
+        return selectRecommendPathListRoute(currentPathId)
+    }
+
+    /**
+     * 通过推荐列表接口选取未加入的新路线，返回第一条可加入候选。
+     */
+    private fun selectRecommendPathListRoute(currentPathId: String?): RouteCandidate? {
+        if (currentPathId.isNullOrBlank()) {
             return null
         }
-        val pathData = fetchRoutePathData(recommendPathId) ?: return null
-        val candidate = buildRouteCandidateFromPathData(pathData) ?: return null
-        if (
-            candidate.pathId != recommendPathId ||
-            isRouteCompleted(candidate.status) ||
-            !isRouteCandidateActionable(pathData)
-        ) {
+        val recommendList = try {
+            val response = JSONObject(AntSportsRpcCall.queryRecommendPathList(currentPathId))
+            if (!isSportsRpcSuccess(response)) {
+                Log.error(TAG, "queryRecommendPathList 请求失败: $response")
+                return null
+            }
+            response.optJSONObject("data")?.optJSONArray("recommendPathList") ?: return null
+        } catch (t: Throwable) {
+            Log.printStackTrace(TAG, t)
             return null
         }
-        return candidate.copy(
-            name = candidate.name.ifBlank { recommendPath.optString("name", recommendPathId) },
-            themeId = candidate.themeId ?: recommendPath.optString("themeId", "").takeIf { it.isNotBlank() },
-            cityId = candidate.cityId ?: recommendPath.optString("cityId", "").takeIf { it.isNotBlank() },
-        )
+        for (index in 0 until recommendList.length()) {
+            val item = recommendList.optJSONObject(index) ?: continue
+            val pathId = item.optString("pathId", "").trim()
+            if (pathId.isBlank() || pathId == currentPathId) {
+                continue
+            }
+            // 仅选未加入的新路线，避免重复加入已完成路线
+            if (item.optString("pathCompleteStatus", "") != "NOT_JOIN") {
+                continue
+            }
+            return RouteCandidate(
+                pathId = pathId,
+                name = item.optString("name", "").ifBlank { pathId },
+                status = item.optString("pathCompleteStatus", ""),
+            )
+        }
+        return null
     }
 
     private fun findMissingKnowledgeRoute(
@@ -6563,8 +6597,13 @@ class AntSports : ModelTask() {
                 }
                 if (ApplicationHookConstants.isOffline()) return
 
+                if (sportsEnergyExchange.value == true) {
+                    sportsEnergyExchange()
+                }
+                if (ApplicationHookConstants.isOffline()) return
+
                 if (neverlandGrid.value == true) {
-                    // 6. 自动走路建造
+                    // 先兑换已选权益，再用剩余能量建造。
                     neverlandAutoTask()
                 }
 
@@ -7951,6 +7990,10 @@ class AntSports : ModelTask() {
         }
 
         private fun neverlandAutoTask() {
+            if (Status.hasFlagToday(StatusFlags.FLAG_ANTSPORTS_NEVERLAND_ENERGY_LIMIT)) {
+                Log.sports("健康岛 · 今日已判定能量不足以单倍建造，跳过自动建造")
+                return
+            }
             try {
                 Log.sports("健康岛 · 启动走路建造任务")
 
@@ -7992,10 +8035,6 @@ class AntSports : ModelTask() {
                         mapId = activeMap.optString("mapId", mapId).ifBlank { mapId }
                         mapName = activeMap.optString("mapName", mapName).ifBlank { mapName }
                     }
-                }
-                if (isNewGame && Status.hasFlagToday(StatusFlags.FLAG_ANTSPORTS_NEVERLAND_ENERGY_LIMIT)) {
-                    Log.sports("健康岛 · 今日已判定能量不足以单倍建造，跳过自动建造")
-                    return
                 }
 
                 Log.sports(String.format(
